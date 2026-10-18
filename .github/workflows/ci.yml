@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SCOUT_REPO: https://github.com/TechLuddite/Luddite-Scout
-      SCOUT_SHA: cbeb849cf80f5d1d2774ade2348ec43c81780b8c
+      SCOUT_SHA: d484fb96482e74681adcc42d22b88fb6db26920f
     steps:
       - name: Fetch Luddite Scout at a pinned commit
         run: |
