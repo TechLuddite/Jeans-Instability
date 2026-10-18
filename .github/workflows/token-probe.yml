@@ -1,0 +1,25 @@
+name: token-probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report token shape only
+        env:
+          T: ${{ github.token }}
+        run: |
+          python3 -I -S - <<'PY'
+          import os, re
+          t = os.environ.pop("T")
+          print("length", len(t))
+          print("ghs_prefix", t.startswith("ghs_"))
+          for name, pat in [("upper", "[A-Z]"), ("lower", "[a-z]"), ("digit", "[0-9]"), ("underscore", "_"),
+                            ("dot", r"\."), ("hyphen", "-"), ("plus", r"\+"), ("slash", "/"), ("equals", "="),
+                            ("whitespace", r"\s"), ("control", r"[\x00-\x1f\x7f]"),
+                            ("other", r"[^A-Za-z0-9_.+/=\s\x00-\x1f\x7f-]")]:
+              print(name, bool(re.search(pat, t)))
+          print("dot_count", t.count("."))
+          print("matches_old_regex", bool(re.fullmatch(r"[A-Za-z0-9_]{20,255}", t)))
+          PY
