@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.techluddite.jeans-instability",
+  "name": "Jeans Instability",
+  "version": "0.2.0",
+  "author": "TechLuddite",
+  "license": "MIT",
+  "description": "Lists the GitHub repositories of your enabled third-party Omarchy plugins that you have not starred, using your gh login, with a star button beside each one.",
+  "homepage": "https://github.com/TechLuddite/Jeans-Instability",
+  "repository": "https://github.com/TechLuddite/Jeans-Instability",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Jeans Instability",
+    "description": "Plugin repositories you have not starred.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,532 @@
+#!/usr/bin/python3 -IS
+"""Jeans Instability: the GitHub repositories of your enabled third-party
+Omarchy plugins that you have not starred.
+
+Usage:
+  jeans-instability                         print a table
+  jeans-instability --json                  print one JSON document (used by the panel)
+  jeans-instability [--json] --star OWNER/REPO
+                                            star one repository from that list
+
+Reads the enabled plugin list from the running Omarchy shell, each plugin's
+manifest.json and .git/config under ~/.config/omarchy/plugins, and asks
+api.github.com whether the signed-in gh account has starred each repository.
+Writes no files. Changes nothing on GitHub unless --star is given, and then
+only stars a repository the same check reports as not starred.
+"""
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import ssl
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "0.2.0"
+
+PLUGIN_LIST_MAX_BYTES = 1048576
+MANIFEST_MAX_BYTES = 262144
+GIT_CONFIG_MAX_BYTES = 65536
+API_MAX_BYTES = 1048576
+MAX_PLUGIN_DIRS = 500
+MAX_PLUGINS = 500
+DEADLINE_SECONDS = 60
+API_HOST = "api.github.com"
+SELF_ID = "io.github.techluddite.jeans-instability"
+
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+REPO_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
+TOKEN_RE = re.compile(r"[A-Za-z0-9_]{20,255}")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+class Failure(Exception):
+    pass
+
+
+def clean(value, limit=200):
+    """A string fit for the panel: no control or bidi characters, capped."""
+    if not isinstance(value, str):
+        return ""
+    return CONTROL_RE.sub("", value)[:limit]
+
+
+def minimal_env(extra=()):
+    env = {"HOME": os.path.expanduser("~"), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    for name in extra:
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    return env
+
+
+def run_bounded(argv, max_bytes, timeout, env):
+    """Run argv in its own session, keep at most max_bytes of stdout, and kill
+    the whole group on overflow or deadline. Returns (returncode, bytes)."""
+    proc = subprocess.Popen(argv, cwd=os.path.expanduser("~"), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    data = bytearray()
+    timer = threading.Timer(timeout, lambda: _kill_group(proc))
+    timer.start()
+    try:
+        while True:
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > max_bytes:
+                _kill_group(proc)
+                proc.wait()
+                raise Failure(f"{os.path.basename(argv[0])} printed more than {max_bytes} bytes")
+        return proc.wait(), bytes(data)
+    finally:
+        timer.cancel()
+        proc.stdout.close()
+        if proc.poll() is None:
+            _kill_group(proc)
+            proc.wait()
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------ local state
+
+def omarchy_path():
+    """The Omarchy checkout the shell runs from. `omarchy dev link` can point
+    OMARCHY_PATH elsewhere; anything that is not an absolute path to a real
+    shell config falls back to the packaged one."""
+    candidate = os.environ.get("OMARCHY_PATH", "")
+    if candidate.startswith("/") and os.path.isfile(os.path.join(candidate, "shell", "shell.qml")):
+        return candidate
+    return "/usr/share/omarchy"
+
+
+def enabled_third_party_ids():
+    """IDs the shell reports as enabled and not first-party, in its order."""
+    base = omarchy_path()
+    env = minimal_env(("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"))
+    env["OMARCHY_PATH"] = base
+    try:
+        rc, out = run_bounded([os.path.join(base, "bin", "omarchy-shell"), "shell", "listPlugins"],
+                              PLUGIN_LIST_MAX_BYTES, 10, env)
+    except OSError as e:
+        raise Failure(f"could not ask the Omarchy shell for its plugins: {e.strerror}") from None
+    if rc != 0:
+        raise Failure("the Omarchy shell is not running or did not answer")
+    try:
+        plugins = json.loads(out)
+    except ValueError:
+        raise Failure("the Omarchy shell returned a plugin list that is not JSON") from None
+    if not isinstance(plugins, list) or len(plugins) > MAX_PLUGINS:
+        raise Failure("the Omarchy shell returned an unexpected plugin list")
+    ids = []
+    for p in plugins:
+        if not isinstance(p, dict) or p.get("firstParty") is not False or p.get("enabled") is not True:
+            continue
+        pid = p.get("id")
+        # This plugin does not list itself.
+        if isinstance(pid, str) and ID_RE.fullmatch(pid) and pid != SELF_ID and pid not in ids:
+            ids.append(pid)
+    return ids
+
+
+def open_plugins_dir():
+    """~/.config/omarchy/plugins as a held descriptor, walked one component at
+    a time without following symlinks. This is the path the shell scans."""
+    fd = os.open(os.path.expanduser("~"), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for name in (".config", "omarchy", "plugins"):
+            nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                raise Failure(f"refusing {name}: not a directory you own")
+        return fd
+    except FileNotFoundError:
+        os.close(fd)
+        return None
+    except OSError as e:
+        os.close(fd)
+        raise Failure(f"cannot open the plugins directory: {e.strerror}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_file(dirfd, name, max_bytes):
+    """Bytes of a regular file you own, read through one descriptor, or None
+    when it is absent, special, someone else's, or larger than max_bytes."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size > max_bytes:
+            return None
+        os.set_blocking(fd, True)
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        return bytes(data) if len(data) <= max_bytes else None
+    finally:
+        os.close(fd)
+
+
+def open_subdir(dirfd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+    except OSError:
+        return None
+    if os.fstat(fd).st_uid != os.geteuid():
+        os.close(fd)
+        return None
+    return fd
+
+
+def origin_url(git_config_text):
+    """url of [remote "origin"] in a .git/config, or ''."""
+    in_origin = False
+    for line in git_config_text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            in_origin = re.fullmatch(r'\[remote\s+"origin"\]', s) is not None
+        elif in_origin:
+            m = re.fullmatch(r"url\s*=\s*(\S+)", s)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def installed_manifests():
+    """{plugin id: {"name", "candidates"}} for every plugin folder. Candidates
+    are the URLs that may name its GitHub repository, best first."""
+    root = open_plugins_dir()
+    if root is None:
+        return {}
+    found = {}
+    try:
+        names = sorted(n for n in os.listdir(root) if not n.startswith("."))[:MAX_PLUGIN_DIRS]
+        for name in names:
+            pfd = open_subdir(root, name)
+            if pfd is None:
+                continue
+            try:
+                raw = read_file(pfd, "manifest.json", MANIFEST_MAX_BYTES)
+                try:
+                    manifest = json.loads(raw) if raw else None
+                except ValueError:
+                    manifest = None
+                if not isinstance(manifest, dict):
+                    continue
+                pid = manifest.get("id")
+                if not isinstance(pid, str) or not ID_RE.fullmatch(pid) or pid in found:
+                    continue
+                origin = ""
+                gfd = open_subdir(pfd, ".git")
+                if gfd is not None:
+                    try:
+                        cfg = read_file(gfd, "config", GIT_CONFIG_MAX_BYTES)
+                        origin = origin_url(cfg.decode("utf-8", "replace")) if cfg else ""
+                    finally:
+                        os.close(gfd)
+                candidates = [manifest.get("repository"), origin, manifest.get("homepage")]
+                found[pid] = {
+                    "name": clean(manifest.get("name")) or pid,
+                    "candidates": [c for c in candidates if isinstance(c, str) and c],
+                }
+            finally:
+                os.close(pfd)
+    finally:
+        os.close(root)
+    return found
+
+
+def github_repo(url):
+    """(owner, repo) when url names a github.com repository, else None.
+    Accepts https://, ssh:// and scp-style git@github.com: forms."""
+    url = url.strip()
+    m = re.fullmatch(r"git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?", url)
+    if not m:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("https", "http", "ssh", "git") or (parts.hostname or "").lower() not in ("github.com", "www.github.com"):
+            return None
+        if parts.username not in (None, "git") or parts.password is not None:
+            return None
+        segs = [s for s in parts.path.split("/") if s]
+        if len(segs) < 2:
+            return None
+        owner, repo = segs[0], re.sub(r"\.git$", "", segs[1])
+    else:
+        owner, repo = m.group(1), m.group(2)
+    if not OWNER_RE.fullmatch(owner) or not REPO_RE.fullmatch(repo) or repo in (".", ".."):
+        return None
+    return owner, repo
+
+
+# ---------------------------------------------------------------- network
+
+def gh_executable():
+    """The GitHub CLI the user runs. Omarchy installs gh through mise; `mise
+    which gh` reports the binary without installing or upgrading anything,
+    asked from the home directory so a project mise.toml cannot redirect it.
+    A system package at /usr/bin/gh is the fallback."""
+    if os.path.isfile("/usr/bin/mise"):
+        try:
+            rc, out = run_bounded(["/usr/bin/mise", "which", "gh"], 4096, 10, minimal_env())
+            path = out.decode("utf-8", "replace").strip()
+            if rc == 0 and path.startswith("/") and "\n" not in path and os.access(path, os.X_OK):
+                return path
+        except (OSError, Failure):
+            pass
+    if os.access("/usr/bin/gh", os.X_OK):
+        return "/usr/bin/gh"
+    return None
+
+
+def gh_token():
+    """Token of gh's active github.com account, held in this process only:
+    never in an argument list, an environment variable, a file or the output."""
+    gh = gh_executable()
+    if not gh:
+        raise Failure("the GitHub CLI (gh) is not installed")
+    env = minimal_env(("XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"))
+    env.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"})
+    try:
+        rc, out = run_bounded([gh, "auth", "token", "--hostname", "github.com"], 512, 10, env)
+    except (OSError, Failure):
+        rc, out = 1, b""
+    token = out.decode("ascii", "replace").strip()
+    if rc != 0 or not TOKEN_RE.fullmatch(token):
+        raise Failure("gh is not signed in to github.com. Run: gh auth login")
+    return token
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class GitHub:
+    def __init__(self, token):
+        self.token = token
+        self.deadline = time.monotonic() + DEADLINE_SECONDS
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirect(),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        )
+
+    def get(self, path):
+        return self.request("GET", path)
+
+    def request(self, method, path):
+        """(status, headers, parsed JSON or None) for one request. Redirects are
+        returned, not followed, so the token only ever goes to api.github.com."""
+        if not path.startswith("/"):
+            raise Failure("bad API path")
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise Failure("GitHub took longer than a minute in total")
+        # PUT /user/starred needs an empty body with Content-Length: 0.
+        req = urllib.request.Request("https://" + API_HOST + path, method=method,
+                                     data=b"" if method == "PUT" else None, headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": f"jeans-instability/{VERSION}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        try:
+            resp = self.opener.open(req, timeout=min(15, left))
+        except urllib.error.HTTPError as e:
+            e.read(4096)
+            e.close()
+            return e.code, e.headers, None
+        except (urllib.error.URLError, OSError) as e:
+            raise Failure(f"network error: {getattr(e, 'reason', e)}") from None
+        with resp:
+            body = resp.read(API_MAX_BYTES + 1)
+        if len(body) > API_MAX_BYTES:
+            raise Failure("GitHub sent a response larger than 1 MiB")
+        try:
+            return resp.status, resp.headers, (json.loads(body) if body else None)
+        except ValueError:
+            raise Failure("GitHub sent a response that is not JSON") from None
+
+    def check(self, status, what):
+        if status == 401:
+            raise Failure("GitHub rejected the gh token. Run: gh auth refresh")
+        if status in (403, 429):
+            raise Failure("GitHub rate limit reached. Try again later")
+        if status != 200 and status != 204:
+            raise Failure(f"GitHub returned {status} for {what}")
+
+    def login(self):
+        status, _, body = self.get("/user")
+        self.check(status, "your account")
+        login = body.get("login") if isinstance(body, dict) else None
+        return clean(login, 39) if isinstance(login, str) else ""
+
+    def canonical(self, owner, repo):
+        """owner/repo as GitHub names it now, following a rename once, or None
+        when the repository is gone or private."""
+        status, headers, body = self.get(f"/repos/{owner}/{repo}")
+        if status in (301, 302, 307, 308):
+            loc = urllib.parse.urlsplit(headers.get("Location", "") if headers else "")
+            if loc.scheme != "https" or loc.hostname != API_HOST or not re.fullmatch(r"/repositories/[0-9]{1,15}", loc.path):
+                return None
+            status, _, body = self.get(loc.path)
+        if status == 404:
+            return None
+        self.check(status, f"{owner}/{repo}")
+        name = body.get("full_name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or "/" not in name:
+            return None
+        o, r = name.split("/", 1)
+        return name if OWNER_RE.fullmatch(o) and REPO_RE.fullmatch(r) else None
+
+    def starred(self, full_name):
+        status, _, _ = self.get(f"/user/starred/{full_name}")
+        if status == 204:
+            return True
+        if status == 404:
+            return False
+        self.check(status, f"star status of {full_name}")
+        return False
+
+    def star(self, full_name):
+        status, _, _ = self.request("PUT", f"/user/starred/{full_name}")
+        if status == 404:
+            raise Failure(f"GitHub would not star {full_name}. The gh token may lack the repo or public_repo scope")
+        self.check(status, f"starring {full_name}")
+
+
+# ------------------------------------------------------------------ main
+
+def survey(github=None):
+    ids = enabled_third_party_ids()
+    manifests = installed_manifests()
+    rows = []
+    for pid in ids:
+        m = manifests.get(pid)
+        if m is None:
+            continue
+        repo = None
+        for url in m["candidates"]:
+            repo = github_repo(url)
+            if repo:
+                break
+        rows.append({"id": pid, "name": m["name"], "declared": "/".join(repo) if repo else ""})
+
+    github = github or GitHub(gh_token())
+    login = github.login()
+
+    def resolve(row):
+        if not row["declared"]:
+            return dict(row, repo="", starred=None, note="no GitHub repository")
+        name = github.canonical(*row["declared"].split("/", 1))
+        if name is None:
+            return dict(row, repo=row["declared"], starred=None, note="not found on GitHub, or private")
+        return dict(row, repo=name, starred=None, note="")
+
+    def own(row):
+        return row["note"] == "" and row["repo"].split("/", 1)[0].lower() == login.lower()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = list(pool.map(resolve, rows))
+        # Repositories under your own account are left out: starring them
+        # says nothing about the plugins you depend on.
+        excluded = sum(1 for r in rows if own(r))
+        rows = [r for r in rows if not own(r)]
+        unique = sorted({r["repo"] for r in rows if r["note"] == ""})
+        stars = dict(zip(unique, pool.map(github.starred, unique)))
+    for r in rows:
+        if r["note"] == "":
+            r["starred"] = stars[r["repo"]]
+    return {"login": login, "plugins": rows, "ownExcluded": excluded}
+
+
+def star(target):
+    """Star target only when a fresh check lists it as an enabled plugin's
+    repository that is not starred, so the panel cannot be made to star
+    anything else."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}", target):
+        raise Failure("not an owner/repo name")
+    github = GitHub(gh_token())
+    rows = survey(github)["plugins"]
+    match = [r["repo"] for r in rows if r.get("starred") is False and r["repo"].lower() == target.lower()]
+    if not match:
+        raise Failure(f"{target} is not an unstarred repository of an enabled plugin")
+    github.star(match[0])
+    return {"starred": match[0]}
+
+
+def main(argv):
+    target = None
+    if "--star" in argv:
+        i = argv.index("--star")
+        if i + 1 >= len(argv):
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        target = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    flags = set(argv)
+    if flags - {"--json", "--help", "--version"} or "--help" in flags:
+        print(__doc__.strip(), file=sys.stderr)
+        return 0 if "--help" in flags else 2
+    if "--version" in flags:
+        print(VERSION)
+        return 0
+    if target is not None:
+        try:
+            result, code = star(target), 0
+        except Failure as e:
+            result, code = {"error": clean(str(e), 300)}, 1
+        if "--json" in flags:
+            sys.stdout.write(json.dumps(result))
+        elif code:
+            print(result["error"], file=sys.stderr)
+        else:
+            print(f"Starred {result['starred']}")
+        return code
+    try:
+        result = survey()
+        code = 0
+    except Failure as e:
+        result, code = {"error": clean(str(e), 300)}, 1
+    if "--json" in flags:
+        sys.stdout.write(json.dumps(result))
+        return code
+    if code:
+        print(result["error"], file=sys.stderr)
+        return code
+    rows = result["plugins"]
+    todo = [r for r in rows if r.get("starred") is False]
+    for r in todo:
+        print(f"{r['name']:<28} https://github.com/{r['repo']}")
+    for r in rows:
+        if r.get("starred") is None:
+            print(f"{r['name']:<28} ({r['note']})", file=sys.stderr)
+    print(f"{len(todo)} of {len(rows)} enabled plugins not starred by {result['login']}"
+          f" ({result['ownExcluded']} in your own repositories not counted)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
